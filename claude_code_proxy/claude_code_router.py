@@ -35,6 +35,51 @@ from common.utils import (
 )
 
 
+def _build_auth_kwargs(
+    api_base: Optional[str],
+    api_key: Optional[str],
+    litellm_params: Optional[dict],
+) -> dict:
+    if not api_base and isinstance(litellm_params, dict):
+        api_base = litellm_params.get("api_base")
+    if not api_key and isinstance(litellm_params, dict):
+        api_key = litellm_params.get("api_key")
+
+    auth_kwargs: dict = {}
+    if api_base:
+        auth_kwargs["api_base"] = api_base
+    if api_key:
+        auth_kwargs["api_key"] = api_key
+    return auth_kwargs
+
+
+def _should_drop_metadata_res_api(
+    litellm_params: Optional[dict],
+    optional_params: Optional[dict],
+) -> bool:
+    if isinstance(litellm_params, dict) and litellm_params.get("drop_metadata_res_api"):
+        return True
+    if isinstance(optional_params, dict) and optional_params.get("drop_metadata_res_api"):
+        return True
+    if isinstance(optional_params, dict):
+        nested_params = optional_params.get("litellm_params")
+        if isinstance(nested_params, dict) and nested_params.get("drop_metadata_res_api"):
+            return True
+    return False
+
+
+def _strip_respapi_metadata(
+    params_respapi: Optional[dict],
+    litellm_params: Optional[dict],
+    optional_params: Optional[dict],
+) -> None:
+    # NOTE: Some upstreams reject metadata in Responses API payloads.
+    if not params_respapi:
+        return
+    if _should_drop_metadata_res_api(litellm_params, optional_params):
+        params_respapi.pop("metadata", None)
+
+
 class RoutedRequest:
     def __init__(
         self,
@@ -185,8 +230,10 @@ class ClaudeCodeRouter(CustomLLM):
                 params_original=optional_params,
                 stream=False,
             )
+            auth_kwargs = _build_auth_kwargs(api_base, api_key, litellm_params)
 
             if routed_request.model_route.use_responses_api:
+                _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
                 response_respapi: ResponsesAPIResponse = litellm.responses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -196,6 +243,7 @@ class ClaudeCodeRouter(CustomLLM):
                     timeout=timeout,
                     client=client,
                     **routed_request.params_respapi,
+                    **auth_kwargs,
                 )
                 response_complapi: ModelResponse = convert_respapi_to_model_response(response_respapi)
 
@@ -211,6 +259,7 @@ class ClaudeCodeRouter(CustomLLM):
                     # Drop any params that are not supported by the provider
                     drop_params=True,
                     **routed_request.params_complapi,
+                    **auth_kwargs,
                 )
 
             if WRITE_TRACES_TO_FILES:
@@ -253,8 +302,10 @@ class ClaudeCodeRouter(CustomLLM):
                 params_original=optional_params,
                 stream=False,
             )
+            auth_kwargs = _build_auth_kwargs(api_base, api_key, litellm_params)
 
             if routed_request.model_route.use_responses_api:
+                _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
                 response_respapi: ResponsesAPIResponse = await litellm.aresponses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -264,6 +315,7 @@ class ClaudeCodeRouter(CustomLLM):
                     timeout=timeout,
                     client=client,
                     **routed_request.params_respapi,
+                    **auth_kwargs,
                 )
                 response_complapi: ModelResponse = convert_respapi_to_model_response(response_respapi)
 
@@ -279,6 +331,7 @@ class ClaudeCodeRouter(CustomLLM):
                     # Drop any params that are not supported by the provider
                     drop_params=True,
                     **routed_request.params_complapi,
+                    **auth_kwargs,
                 )
 
             if WRITE_TRACES_TO_FILES:
@@ -321,8 +374,10 @@ class ClaudeCodeRouter(CustomLLM):
                 params_original=optional_params,
                 stream=True,
             )
+            auth_kwargs = _build_auth_kwargs(api_base, api_key, litellm_params)
 
             if routed_request.model_route.use_responses_api:
+                _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
                 resp_stream: BaseResponsesAPIStreamingIterator = litellm.responses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -332,6 +387,7 @@ class ClaudeCodeRouter(CustomLLM):
                     timeout=timeout,
                     client=client,
                     **routed_request.params_respapi,
+                    **auth_kwargs,
                 )
 
             else:
@@ -345,6 +401,7 @@ class ClaudeCodeRouter(CustomLLM):
                     # Drop any params that are not supported by the provider
                     drop_params=True,
                     **routed_request.params_complapi,
+                    **auth_kwargs,
                 )
 
             for chunk_idx, chunk in enumerate[ModelResponseStream | ResponsesAPIStreamingResponse](resp_stream):
@@ -410,8 +467,10 @@ class ClaudeCodeRouter(CustomLLM):
                 params_original=optional_params,
                 stream=True,
             )
+            auth_kwargs = _build_auth_kwargs(api_base, api_key, litellm_params)
 
             if routed_request.model_route.use_responses_api:
+                _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
                 resp_stream: BaseResponsesAPIStreamingIterator = await litellm.aresponses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -421,6 +480,7 @@ class ClaudeCodeRouter(CustomLLM):
                     timeout=timeout,
                     client=client,
                     **routed_request.params_respapi,
+                    **auth_kwargs,
                 )
 
             else:
@@ -434,6 +494,7 @@ class ClaudeCodeRouter(CustomLLM):
                     # Drop any params that are not supported by the provider
                     drop_params=True,
                     **routed_request.params_complapi,
+                    **auth_kwargs,
                 )
 
             chunk_idx = 0
