@@ -80,6 +80,36 @@ def _strip_respapi_metadata(
         params_respapi.pop("metadata", None)
 
 
+def _should_drop_thinking_blocks_res_api(
+    litellm_params: Optional[dict],
+    optional_params: Optional[dict],
+) -> bool:
+    if isinstance(litellm_params, dict) and litellm_params.get("drop_thinking_blocks_res_api"):
+        return True
+    if isinstance(optional_params, dict) and optional_params.get("drop_thinking_blocks_res_api"):
+        return True
+    if isinstance(optional_params, dict):
+        nested_params = optional_params.get("litellm_params")
+        if isinstance(nested_params, dict) and nested_params.get("drop_thinking_blocks_res_api"):
+            return True
+    return False
+
+
+def _strip_respapi_thinking_blocks(
+    messages_respapi: Optional[list],
+    litellm_params: Optional[dict],
+    optional_params: Optional[dict],
+) -> None:
+    # NOTE: Some upstreams reject thinking_blocks in Responses API payloads.
+    if not messages_respapi:
+        return
+    if not _should_drop_thinking_blocks_res_api(litellm_params, optional_params):
+        return
+    for item in messages_respapi:
+        if isinstance(item, dict):
+            item.pop("thinking_blocks", None)
+
+
 class RoutedRequest:
     def __init__(
         self,
@@ -234,6 +264,7 @@ class ClaudeCodeRouter(CustomLLM):
 
             if routed_request.model_route.use_responses_api:
                 _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
+                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params, optional_params)
                 response_respapi: ResponsesAPIResponse = litellm.responses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -306,6 +337,7 @@ class ClaudeCodeRouter(CustomLLM):
 
             if routed_request.model_route.use_responses_api:
                 _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
+                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params, optional_params)
                 response_respapi: ResponsesAPIResponse = await litellm.aresponses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -378,6 +410,7 @@ class ClaudeCodeRouter(CustomLLM):
 
             if routed_request.model_route.use_responses_api:
                 _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
+                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params, optional_params)
                 resp_stream: BaseResponsesAPIStreamingIterator = litellm.responses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -471,6 +504,7 @@ class ClaudeCodeRouter(CustomLLM):
 
             if routed_request.model_route.use_responses_api:
                 _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
+                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params, optional_params)
                 resp_stream: BaseResponsesAPIStreamingIterator = await litellm.aresponses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
