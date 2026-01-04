@@ -84,8 +84,12 @@ class ModelRoute:
             self.target_model = f"{OPENAI}/{model_name_only}"
 
         self.is_target_anthropic = self.target_model.startswith(f"{ANTHROPIC}/")
+        self.is_target_mistral = self.target_model.startswith("mistral/")
 
         if self.is_target_anthropic:
+            self.use_responses_api = False
+        elif self.is_target_mistral:
+            # Mistral doesn't support Responses API - use completion API
             self.use_responses_api = False
         else:
             self.use_responses_api = ALWAYS_USE_RESPONSES_API or any(

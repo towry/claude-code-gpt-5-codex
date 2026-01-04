@@ -53,61 +53,125 @@ def _build_auth_kwargs(
     return auth_kwargs
 
 
-def _should_drop_metadata_res_api(
-    litellm_params: Optional[dict],
-    optional_params: Optional[dict],
-) -> bool:
-    if isinstance(litellm_params, dict) and litellm_params.get("drop_metadata_res_api"):
-        return True
-    if isinstance(optional_params, dict) and optional_params.get("drop_metadata_res_api"):
-        return True
-    if isinstance(optional_params, dict):
-        nested_params = optional_params.get("litellm_params")
-        if isinstance(nested_params, dict) and nested_params.get("drop_metadata_res_api"):
-            return True
-    return False
-
-
-def _strip_respapi_metadata(
-    params_respapi: Optional[dict],
-    litellm_params: Optional[dict],
-    optional_params: Optional[dict],
-) -> None:
-    # NOTE: Some upstreams reject metadata in Responses API payloads.
-    if not params_respapi:
-        return
-    if _should_drop_metadata_res_api(litellm_params, optional_params):
+def _strip_respapi_metadata(params_respapi: Optional[dict]) -> None:
+    # NOTE: OpenAI Responses API upstreams reject Anthropic-specific metadata.
+    # Always strip for Responses API since it's only used for non-anthropic models.
+    if params_respapi:
         params_respapi.pop("metadata", None)
 
 
-def _should_drop_thinking_blocks_res_api(
-    litellm_params: Optional[dict],
-    optional_params: Optional[dict],
-) -> bool:
-    if isinstance(litellm_params, dict) and litellm_params.get("drop_thinking_blocks_res_api"):
-        return True
-    if isinstance(optional_params, dict) and optional_params.get("drop_thinking_blocks_res_api"):
-        return True
-    if isinstance(optional_params, dict):
-        nested_params = optional_params.get("litellm_params")
-        if isinstance(nested_params, dict) and nested_params.get("drop_thinking_blocks_res_api"):
-            return True
-    return False
+def _should_preserve_thinking_blocks(litellm_params: Optional[dict]) -> bool:
+    """Check if thinking_blocks should be preserved for Anthropic-compatible upstreams."""
+    if not litellm_params:
+        return False
+    additional_drop_params = litellm_params.get("additional_drop_params", [])
+    return "preserve_thinking_blocks" in additional_drop_params
 
 
-def _strip_respapi_thinking_blocks(
-    messages_respapi: Optional[list],
-    litellm_params: Optional[dict],
-    optional_params: Optional[dict],
-) -> None:
-    # NOTE: Some upstreams reject thinking_blocks in Responses API payloads.
-    if not messages_respapi:
+def _strip_respapi_thinking_blocks(messages_respapi: Optional[list], litellm_params: Optional[dict] = None) -> None:
+    # NOTE: OpenAI Responses API upstreams reject Anthropic-specific thinking_blocks.
+    # Skip stripping if preserve_thinking_blocks is set (for Anthropic-compatible upstreams).
+    if _should_preserve_thinking_blocks(litellm_params):
         return
-    if not _should_drop_thinking_blocks_res_api(litellm_params, optional_params):
+    if not messages_respapi:
         return
     for item in messages_respapi:
         if isinstance(item, dict):
             item.pop("thinking_blocks", None)
+
+
+def _fix_tool_call_response_pairing(messages: list) -> list:
+    """
+    Fix tool call/response pairing for providers like Mistral that require
+    every tool_call to have a matching tool response.
+
+    Mistral errors:
+    - "Not the same number of function calls and responses"
+    - "Unexpected role 'tool' after role 'system'"
+
+    Strategy: Keep only complete pairs (tool_call + tool response).
+    Also ensure tool messages only appear immediately after their assistant message.
+    """
+    if not messages:
+        return messages
+
+    # Pass 1: Collect all tool_call_ids from assistant messages with their indices
+    call_ids = set()
+    call_id_to_msg_idx = {}
+    for idx, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                tc_id = tc.get("id")
+                if tc_id:
+                    call_ids.add(tc_id)
+                    call_id_to_msg_idx[tc_id] = idx
+
+    # Pass 2: Collect tool_call_ids that have BOTH a call AND a response after the call
+    responded_ids = set()
+    for idx, msg in enumerate(messages):
+        if msg.get("role") == "tool" and msg.get("tool_call_id"):
+            tc_id = msg["tool_call_id"]
+            if tc_id in call_ids:
+                # Ensure tool response comes after the assistant message
+                call_idx = call_id_to_msg_idx.get(tc_id, -1)
+                if call_idx >= 0 and idx > call_idx:
+                    responded_ids.add(tc_id)
+
+    # Pass 3: Build fixed messages - keep only complete pairs in correct order
+    fixed_messages = []
+    prev_role = None
+    prev_had_tool_calls = False
+
+    for idx, msg in enumerate(messages):
+        role = msg.get("role")
+
+        if role == "assistant" and msg.get("tool_calls"):
+            tool_calls = msg["tool_calls"]
+            # Keep only tool_calls that have responses
+            valid_calls = [tc for tc in tool_calls if tc.get("id") in responded_ids]
+            if valid_calls:
+                msg = dict(msg)  # Don't mutate original
+                msg["tool_calls"] = valid_calls
+                fixed_messages.append(msg)
+                prev_had_tool_calls = True
+            elif msg.get("content"):
+                # Keep the message but remove tool_calls if there's still content
+                msg = dict(msg)
+                msg.pop("tool_calls", None)
+                fixed_messages.append(msg)
+                prev_had_tool_calls = False
+            else:
+                # Skip the message entirely (no valid tool_calls, no content)
+                prev_had_tool_calls = False
+                prev_role = role
+                continue
+
+        elif role == "tool":
+            # Only keep tool responses that:
+            # 1. Have matching tool_calls in responded_ids
+            # 2. Previous message was assistant (or another tool from same batch)
+            tc_id = msg.get("tool_call_id")
+            if tc_id in responded_ids:
+                if prev_role == "assistant" and prev_had_tool_calls:
+                    fixed_messages.append(msg)
+                    prev_role = role
+                    continue
+                elif prev_role == "tool":
+                    # Allow consecutive tool messages (batch responses)
+                    fixed_messages.append(msg)
+                    prev_role = role
+                    continue
+            # Skip this tool message - don't update prev_role so next tool can still check
+            print(f"[_fix_tool_call_response_pairing] Skipping tool msg: tc_id={tc_id}, prev_role={prev_role}, prev_had_tool_calls={prev_had_tool_calls}")
+            continue
+
+        else:
+            fixed_messages.append(msg)
+            prev_had_tool_calls = False
+
+        prev_role = role
+
+    return fixed_messages
 
 
 class RoutedRequest:
@@ -119,10 +183,12 @@ class RoutedRequest:
         messages_original: list,
         params_original: dict,
         stream: bool,
+        litellm_params: Optional[dict] = None,
     ) -> None:
         self.timestamp = generate_timestamp_utc()
         self.calling_method = calling_method
         self.model_route = ModelRoute(model)
+        self.litellm_params = litellm_params or {}
 
         self.messages_original = messages_original
         self.params_original = params_original
@@ -175,6 +241,19 @@ class RoutedRequest:
         #  (This fix was contributed)
         self.params_complapi.pop("context_management", None)
 
+        # Strip Anthropic-specific thinking_blocks from messages for non-Anthropic models
+        # (e.g., Mistral rejects these with "Extra inputs are not permitted")
+        # Skip if preserve_thinking_blocks is in additional_drop_params (Anthropic-compatible upstreams)
+        if not _should_preserve_thinking_blocks(self.litellm_params):
+            for msg in self.messages_complapi:
+                if isinstance(msg, dict):
+                    msg.pop("thinking_blocks", None)
+
+        # Fix tool call/response pairing for providers like Mistral
+        # (Mistral error: "Not the same number of function calls and responses")
+        if self.model_route.target_model.startswith("mistral/"):
+            self.messages_complapi = _fix_tool_call_response_pairing(self.messages_complapi)
+
         if (
             self.params_complapi.get("max_tokens") == 1
             and len(self.messages_complapi) == 1
@@ -189,6 +268,11 @@ class RoutedRequest:
             self.messages_complapi[0][
                 "content"
             ] = "The intention of this request is to test connectivity. Please respond with a single word: OK"
+            return
+
+        # Skip system prompt injection for Mistral - it has strict message ordering
+        # and doesn't allow system messages after tool messages
+        if self.model_route.target_model.startswith("mistral/"):
             return
 
         system_prompt_items = []
@@ -259,12 +343,13 @@ class ClaudeCodeRouter(CustomLLM):
                 messages_original=messages,
                 params_original=optional_params,
                 stream=False,
+                litellm_params=litellm_params,
             )
             auth_kwargs = _build_auth_kwargs(api_base, api_key, litellm_params)
 
             if routed_request.model_route.use_responses_api:
-                _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
-                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params, optional_params)
+                _strip_respapi_metadata(routed_request.params_respapi)
+                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params)
                 response_respapi: ResponsesAPIResponse = litellm.responses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -332,12 +417,13 @@ class ClaudeCodeRouter(CustomLLM):
                 messages_original=messages,
                 params_original=optional_params,
                 stream=False,
+                litellm_params=litellm_params,
             )
             auth_kwargs = _build_auth_kwargs(api_base, api_key, litellm_params)
 
             if routed_request.model_route.use_responses_api:
-                _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
-                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params, optional_params)
+                _strip_respapi_metadata(routed_request.params_respapi)
+                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params)
                 response_respapi: ResponsesAPIResponse = await litellm.aresponses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -405,12 +491,13 @@ class ClaudeCodeRouter(CustomLLM):
                 messages_original=messages,
                 params_original=optional_params,
                 stream=True,
+                litellm_params=litellm_params,
             )
             auth_kwargs = _build_auth_kwargs(api_base, api_key, litellm_params)
 
             if routed_request.model_route.use_responses_api:
-                _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
-                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params, optional_params)
+                _strip_respapi_metadata(routed_request.params_respapi)
+                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params)
                 resp_stream: BaseResponsesAPIStreamingIterator = litellm.responses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
@@ -499,12 +586,13 @@ class ClaudeCodeRouter(CustomLLM):
                 messages_original=messages,
                 params_original=optional_params,
                 stream=True,
+                litellm_params=litellm_params,
             )
             auth_kwargs = _build_auth_kwargs(api_base, api_key, litellm_params)
 
             if routed_request.model_route.use_responses_api:
-                _strip_respapi_metadata(routed_request.params_respapi, litellm_params, optional_params)
-                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params, optional_params)
+                _strip_respapi_metadata(routed_request.params_respapi)
+                _strip_respapi_thinking_blocks(routed_request.messages_respapi, litellm_params)
                 resp_stream: BaseResponsesAPIStreamingIterator = await litellm.aresponses(
                     # TODO Make sure all params are supported
                     model=routed_request.model_route.target_model,
