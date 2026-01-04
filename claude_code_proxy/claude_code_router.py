@@ -1,5 +1,6 @@
 from copy import deepcopy
 from typing import AsyncGenerator, Callable, Generator, Optional, Union
+import hashlib
 
 import httpx
 import litellm
@@ -78,6 +79,61 @@ def _strip_respapi_thinking_blocks(messages_respapi: Optional[list], litellm_par
     for item in messages_respapi:
         if isinstance(item, dict):
             item.pop("thinking_blocks", None)
+
+
+def _normalize_tool_call_id_for_mistral(original_id: str) -> str:
+    """
+    Generate a Mistral-compatible tool call ID from the original ID.
+    Mistral requires: alphanumeric only (a-z, A-Z, 0-9), exactly 9 characters.
+
+    Uses SHA-256 hash to ensure deterministic mapping and collision resistance.
+    """
+    # Create hash of original ID
+    hash_digest = hashlib.sha256(original_id.encode()).hexdigest()
+    # Take first 9 characters (all hex digits are alphanumeric)
+    return hash_digest[:9]
+
+
+def _normalize_mistral_tool_calls(messages: list) -> list:
+    """
+    Normalize all tool call IDs in messages to be Mistral-compatible.
+    Creates a mapping to ensure consistency between tool_calls and tool responses.
+    """
+    if not messages:
+        return messages
+
+    # Build ID mapping for all tool calls first
+    id_mapping = {}
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                original_id = tc.get("id")
+                if original_id and original_id not in id_mapping:
+                    id_mapping[original_id] = _normalize_tool_call_id_for_mistral(original_id)
+
+    # Apply mapping to both tool_calls and tool responses
+    normalized_messages = []
+    for msg in messages:
+        msg = dict(msg)  # Don't mutate original
+
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tool_calls = []
+            for tc in msg["tool_calls"]:
+                tc = dict(tc)
+                original_id = tc.get("id")
+                if original_id and original_id in id_mapping:
+                    tc["id"] = id_mapping[original_id]
+                tool_calls.append(tc)
+            msg["tool_calls"] = tool_calls
+
+        elif msg.get("role") == "tool":
+            original_id = msg.get("tool_call_id")
+            if original_id and original_id in id_mapping:
+                msg["tool_call_id"] = id_mapping[original_id]
+
+        normalized_messages.append(msg)
+
+    return normalized_messages
 
 
 def _fix_tool_call_response_pairing(messages: list) -> list:
@@ -253,6 +309,10 @@ class RoutedRequest:
         # (Mistral error: "Not the same number of function calls and responses")
         if self.model_route.target_model.startswith("mistral/"):
             self.messages_complapi = _fix_tool_call_response_pairing(self.messages_complapi)
+            # Normalize tool call IDs to meet Mistral's format requirements:
+            # - Alphanumeric only (a-z, A-Z, 0-9)
+            # - Exactly 9 characters
+            self.messages_complapi = _normalize_mistral_tool_calls(self.messages_complapi)
 
         if (
             self.params_complapi.get("max_tokens") == 1
