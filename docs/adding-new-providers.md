@@ -41,7 +41,7 @@ else:
 - Responses API: `litellm.aresponses()` 
 - Completion API: `litellm.acompletion()`
 
-### 2. Message Field Stripping (`claude_code_router.py`)
+### 2. Message Field Stripping (`provider_transforms.py`)
 
 Anthropic-specific fields that other providers may reject:
 
@@ -52,10 +52,14 @@ Anthropic-specific fields that other providers may reject:
 | `context_management` | Various | Strip from params |
 
 ```python
-# In RoutedRequest._adapt_complapi_for_non_anthropic_models()
-for msg in self.messages_complapi:
-    if isinstance(msg, dict):
-        msg.pop("thinking_blocks", None)
+# In provider_transforms.py
+_REQUEST_RULES.append(
+    ProviderRule(
+        name="strip_thinking_blocks_non_anthropic",
+        when=lambda ctx: (not ctx.model_route.is_target_anthropic),
+        apply=lambda ctx: _strip_thinking_blocks_from_messages(ctx.messages),
+    )
+)
 ```
 
 ### 3. Tool Call/Response Pairing
@@ -73,8 +77,16 @@ Some providers (like Mistral) require strict pairing between tool_calls and tool
 4. Ensures tool messages only follow assistant messages with tool_calls
 
 ```python
-if self.model_route.target_model.startswith("mistral/"):
-    self.messages_complapi = _fix_tool_call_response_pairing(self.messages_complapi)
+def _apply_mistral_fixes(ctx) -> None:
+    ctx.messages[:] = _fix_tool_call_response_pairing(ctx.messages)
+
+_REQUEST_RULES.append(
+    ProviderRule(
+        name="mistral_tool_pairing",
+        when=lambda ctx: ctx.model_route.target_model.startswith("mistral/"),
+        apply=_apply_mistral_fixes,
+    )
+)
 ```
 
 ### 4. Message Order Constraints
@@ -86,12 +98,16 @@ Some providers have strict message ordering rules:
 | Mistral | No `system` after `tool` |
 | Mistral | `tool` must immediately follow `assistant` with `tool_calls` |
 
-**Solution:** Skip system message injection for strict providers:
+**Solution:** Narrow the system prompt injection rule for strict providers:
 
 ```python
-# Skip system prompt injection for Mistral
-if self.model_route.target_model.startswith("mistral/"):
-    return
+_REQUEST_RULES.append(
+    ProviderRule(
+        name="inject_system_prompt_instructions",
+        when=lambda ctx: (not ctx.model_route.is_target_mistral),
+        apply=_inject_system_prompt_instructions,
+    )
+)
 ```
 
 ## Debugging Steps
@@ -160,18 +176,33 @@ self.is_target_newprovider = self.target_model.startswith("newprovider/")
 if self.is_target_newprovider:
     self.use_responses_api = False  # or True based on capability
 
-# 2. In claude_code_router.py - Add field stripping if needed
-if self.model_route.target_model.startswith("newprovider/"):
-    for msg in self.messages_complapi:
-        msg.pop("provider_specific_field", None)
+# 2. In provider_transforms.py - Add provider-specific rules
+def _strip_newprovider_fields(messages: list) -> None:
+    for msg in messages:
+        if isinstance(msg, dict):
+            msg.pop("provider_specific_field", None)
 
-# 3. In claude_code_router.py - Add message fixes if needed
-if self.model_route.target_model.startswith("newprovider/"):
-    self.messages_complapi = _fix_tool_call_response_pairing(self.messages_complapi)
+_REQUEST_RULES.append(
+    ProviderRule(
+        name="newprovider_strip_field",
+        when=lambda ctx: ctx.model_route.target_model.startswith("newprovider/"),
+        apply=lambda ctx: _strip_newprovider_fields(ctx.messages),
+    )
+)
 
-# 4. Skip system injection if strict ordering
-if self.model_route.target_model.startswith("newprovider/"):
-    return
+def _apply_newprovider_tool_pairing(ctx) -> None:
+    ctx.messages[:] = _fix_tool_call_response_pairing(ctx.messages)
+
+_REQUEST_RULES.append(
+    ProviderRule(
+        name="newprovider_tool_pairing",
+        when=lambda ctx: ctx.model_route.target_model.startswith("newprovider/"),
+        apply=_apply_newprovider_tool_pairing,
+    )
+)
+
+# 3. If strict ordering, skip system prompt injection by narrowing the rule
+# (See provider_transforms.py: "inject_system_prompt_instructions")
 ```
 
 ## LiteLLM Config Example
